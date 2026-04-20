@@ -1,0 +1,311 @@
+from __future__ import annotations
+
+import argparse
+from datetime import datetime
+import json
+import mimetypes
+from dataclasses import dataclass
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
+
+from autolife_robot_sdk import ROBOT_URDF_PATH
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+STATIC_ROOT = PROJECT_ROOT / "static"
+SDK_URDF_PATH = Path(ROBOT_URDF_PATH).resolve()
+SAVED_ACTIONS_ROOT = PROJECT_ROOT / "saved_actions"
+
+
+def resolve_descriptions_root(urdf_path: Path) -> Path:
+    for candidate in (urdf_path.parent, *urdf_path.parents):
+        if candidate.name == "descriptions":
+            return candidate
+
+    raise ValueError(f"Unable to locate descriptions root from ROBOT_URDF_PATH: {urdf_path}")
+
+
+DESCRIPTIONS_ROOT = resolve_descriptions_root(SDK_URDF_PATH)
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    host: str
+    port: int
+
+
+def build_manifest() -> dict:
+    urdf_path = resolve_sdk_urdf_path()
+    relative_urdf_path = urdf_path.relative_to(DESCRIPTIONS_ROOT)
+    model_name = relative_urdf_path.parts[0]
+    file_name = relative_urdf_path.name
+    joint_order = extract_joint_order(urdf_path)
+
+    default_selection = {
+        "model": model_name,
+        "file": file_name,
+    }
+
+    return {
+        "generatedAt": None,
+        "defaultSelection": default_selection,
+        "urdfPath": str(urdf_path),
+        "jointOrder": joint_order,
+        "robots": [
+            {
+                "model": model_name,
+                "files": [
+                    {
+                        "file": file_name,
+                        "label": file_name.removesuffix(".urdf"),
+                        "url": f"/robots/{relative_urdf_path.as_posix()}",
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def resolve_sdk_urdf_path() -> Path:
+    sdk_urdf_path = SDK_URDF_PATH
+
+    if not sdk_urdf_path.exists():
+        raise FileNotFoundError(f"SDK ROBOT_URDF_PATH not found: {sdk_urdf_path}")
+
+    try:
+        sdk_urdf_path.relative_to(DESCRIPTIONS_ROOT.resolve())
+    except ValueError as error:
+        raise ValueError(f"SDK ROBOT_URDF_PATH is outside descriptions root: {sdk_urdf_path}") from error
+
+    return sdk_urdf_path
+
+
+def extract_joint_order(urdf_path: Path) -> list[str]:
+    root = ET.fromstring(urdf_path.read_text(encoding="utf-8"))
+    joint_names: list[str] = []
+
+    for joint_node in root.findall("joint"):
+        joint_name = joint_node.attrib.get("name")
+        if joint_name:
+            joint_names.append(joint_name)
+
+    return joint_names
+
+
+def safe_join(root: Path, relative_path: str) -> Path | None:
+    candidate = (root / relative_path).resolve()
+    try:
+        candidate.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return candidate
+
+
+def list_saved_actions() -> list[dict]:
+    if not SAVED_ACTIONS_ROOT.exists():
+        return []
+
+    actions: list[dict] = []
+
+    for action_path in sorted(
+        SAVED_ACTIONS_ROOT.glob("*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    ):
+        try:
+            payload = json.loads(action_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        if not isinstance(payload, dict):
+            continue
+
+        actions.append(
+            {
+                "fileName": action_path.name,
+                "title": action_path.stem,
+                "path": str(action_path),
+                "payload": {
+                    "left_arm": payload.get("left_arm", []),
+                    "right_arm": payload.get("right_arm", []),
+                    "waist_leg": payload.get("waist_leg", []),
+                    "duration": payload.get("duration", 2.0),
+                },
+            }
+        )
+
+    return actions
+
+
+class RobotViewerHandler(BaseHTTPRequestHandler):
+    manifest = build_manifest()
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        request_path = parsed.path
+
+        if request_path in {"/", "/index.html"}:
+            self.serve_file(STATIC_ROOT / "index.html", content_type="text/html; charset=utf-8")
+            return
+
+        if request_path == "/api/manifest":
+            self.serve_json(self.manifest)
+            return
+
+        if request_path == "/api/saved-actions":
+            self.serve_json({"actions": list_saved_actions()})
+            return
+
+        if request_path.startswith("/static/"):
+            relative_path = request_path.removeprefix("/static/")
+            file_path = safe_join(STATIC_ROOT, relative_path)
+            if file_path is None:
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            self.serve_file(file_path)
+            return
+
+        if request_path.startswith("/robots/"):
+            relative_path = request_path.removeprefix("/robots/")
+            file_path = safe_join(DESCRIPTIONS_ROOT, relative_path)
+            if file_path is None:
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            self.serve_file(file_path)
+            return
+
+        self.send_error(HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        request_path = parsed.path
+
+        if request_path == "/api/save-pose":
+            self.handle_save_pose()
+            return
+
+        self.send_error(HTTPStatus.NOT_FOUND)
+
+    def log_message(self, format: str, *args) -> None:
+        return
+
+    def serve_json(self, payload: dict) -> None:
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def serve_file(self, file_path: Path, content_type: str | None = None) -> None:
+        if not file_path.exists() or not file_path.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+
+        body = file_path.read_bytes()
+        guessed_type, _ = mimetypes.guess_type(str(file_path))
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type or guessed_type or "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_save_pose(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid JSON body")
+            return
+
+        if not isinstance(payload, dict):
+            self.send_error(HTTPStatus.BAD_REQUEST, "Payload must be an object")
+            return
+
+        SAVED_ACTIONS_ROOT.mkdir(parents=True, exist_ok=True)
+
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Title is required")
+            return
+
+        safe_title = sanitize_file_name(title)
+        target_path = next_available_action_path(safe_title)
+
+        save_payload = {
+            "left_arm": payload.get("left_arm", []),
+            "right_arm": payload.get("right_arm", []),
+            "waist_leg": payload.get("waist_leg", []),
+            "duration": float(payload.get("duration", 2.0)),
+        }
+
+        target_path.write_text(format_action_payload(save_payload), encoding="utf-8")
+
+        self.serve_json(
+            {
+                "ok": True,
+                "path": str(target_path),
+                "fileName": target_path.name,
+                "title": title,
+            }
+        )
+
+
+def sanitize_file_name(name: str) -> str:
+    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in name.strip())
+    safe = safe.strip("_")
+    return safe or "robot_action"
+
+
+def next_available_action_path(base_name: str) -> Path:
+    candidate = SAVED_ACTIONS_ROOT / f"{base_name}.json"
+    if not candidate.exists():
+        return candidate
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return SAVED_ACTIONS_ROOT / f"{base_name}_{timestamp}.json"
+
+
+def format_action_payload(payload: dict) -> str:
+    ordered_keys = ["left_arm", "right_arm", "waist_leg", "duration"]
+    lines = ["{"]
+
+    for index, key in enumerate(ordered_keys):
+        value = payload.get(key)
+        if isinstance(value, list):
+            rendered_value = json.dumps(value, ensure_ascii=False)
+        else:
+            rendered_value = json.dumps(value, ensure_ascii=False)
+
+        suffix = "," if index < len(ordered_keys) - 1 else ""
+        lines.append(f'  "{key}": {rendered_value}{suffix}')
+
+    lines.append("}\n")
+    return "\n".join(lines)
+
+
+def parse_args() -> AppConfig:
+    parser = argparse.ArgumentParser(description="Python URDF web viewer")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    args = parser.parse_args()
+    return AppConfig(host=args.host, port=args.port)
+
+
+def main() -> None:
+    if not DESCRIPTIONS_ROOT.exists():
+        raise FileNotFoundError(f"Descriptions directory not found: {DESCRIPTIONS_ROOT}")
+
+    config = parse_args()
+    server = ThreadingHTTPServer((config.host, config.port), RobotViewerHandler)
+    print(f"Robot viewer running at http://{config.host}:{config.port}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
