@@ -17,6 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = PROJECT_ROOT / "static"
 SDK_URDF_PATH = Path(ROBOT_URDF_PATH).resolve()
 SAVED_ACTIONS_ROOT = PROJECT_ROOT / "saved_actions"
+SAVED_PROJECTS_ROOT = PROJECT_ROOT / "saved_projects"
 
 
 def resolve_descriptions_root(urdf_path: Path) -> Path:
@@ -139,6 +140,79 @@ def list_saved_actions() -> list[dict]:
     return actions
 
 
+def default_project_payload() -> dict:
+    return {
+        "title": "untitled_project",
+        "duration": 12.0,
+        "controlHz": 100,
+        "topics": {
+            "motion": "/robot/motion_plan",
+            "voice": "/robot/tts_plan",
+        },
+        "jointNames": [],
+        "actionKeyframes": [],
+        "voiceClips": [],
+    }
+
+
+def list_saved_projects() -> list[dict]:
+    if not SAVED_PROJECTS_ROOT.exists():
+        return []
+
+    projects: list[dict] = []
+
+    for project_path in sorted(
+        SAVED_PROJECTS_ROOT.glob("*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    ):
+        try:
+            payload = json.loads(project_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        if not isinstance(payload, dict):
+            continue
+
+        merged_payload = default_project_payload()
+        merged_payload.update(payload)
+        merged_payload["topics"] = {
+            **default_project_payload()["topics"],
+            **(payload.get("topics") if isinstance(payload.get("topics"), dict) else {}),
+        }
+
+        projects.append(
+            {
+                "fileName": project_path.name,
+                "title": str(merged_payload.get("title") or project_path.stem),
+                "path": str(project_path),
+                "payload": merged_payload,
+            }
+        )
+
+    return projects
+
+
+def normalize_project_payload(payload: dict) -> dict:
+    normalized = default_project_payload()
+    normalized.update(payload)
+
+    topics = payload.get("topics") if isinstance(payload.get("topics"), dict) else {}
+    normalized["topics"] = {
+        **default_project_payload()["topics"],
+        **topics,
+    }
+
+    normalized["title"] = str(normalized.get("title") or "untitled_project").strip() or "untitled_project"
+    normalized["duration"] = max(1.0, float(normalized.get("duration", 12.0)))
+    normalized["controlHz"] = max(1, int(normalized.get("controlHz", 100)))
+    normalized["jointNames"] = list(normalized.get("jointNames") or [])
+    normalized["actionKeyframes"] = list(normalized.get("actionKeyframes") or [])
+    normalized["voiceClips"] = list(normalized.get("voiceClips") or [])
+
+    return normalized
+
+
 class RobotViewerHandler(BaseHTTPRequestHandler):
     manifest = build_manifest()
 
@@ -156,6 +230,10 @@ class RobotViewerHandler(BaseHTTPRequestHandler):
 
         if request_path == "/api/saved-actions":
             self.serve_json({"actions": list_saved_actions()})
+            return
+
+        if request_path == "/api/projects":
+            self.serve_json({"projects": list_saved_projects()})
             return
 
         if request_path.startswith("/static/"):
@@ -184,6 +262,10 @@ class RobotViewerHandler(BaseHTTPRequestHandler):
 
         if request_path == "/api/save-pose":
             self.handle_save_pose()
+            return
+
+        if request_path == "/api/save-project":
+            self.handle_save_project()
             return
 
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -244,7 +326,7 @@ class RobotViewerHandler(BaseHTTPRequestHandler):
             "duration": float(payload.get("duration", 2.0)),
         }
 
-        target_path.write_text(format_action_payload(save_payload), encoding="utf-8")
+        target_path.write_text(format_json_payload(save_payload), encoding="utf-8")
 
         self.serve_json(
             {
@@ -252,6 +334,36 @@ class RobotViewerHandler(BaseHTTPRequestHandler):
                 "path": str(target_path),
                 "fileName": target_path.name,
                 "title": title,
+            }
+        )
+
+    def handle_save_project(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid JSON body")
+            return
+
+        if not isinstance(payload, dict):
+            self.send_error(HTTPStatus.BAD_REQUEST, "Payload must be an object")
+            return
+
+        SAVED_PROJECTS_ROOT.mkdir(parents=True, exist_ok=True)
+
+        normalized_payload = normalize_project_payload(payload)
+        safe_title = sanitize_file_name(normalized_payload["title"])
+        target_path = next_available_project_path(safe_title)
+        target_path.write_text(format_json_payload(normalized_payload), encoding="utf-8")
+
+        self.serve_json(
+            {
+                "ok": True,
+                "path": str(target_path),
+                "fileName": target_path.name,
+                "title": normalized_payload["title"],
             }
         )
 
@@ -271,22 +383,17 @@ def next_available_action_path(base_name: str) -> Path:
     return SAVED_ACTIONS_ROOT / f"{base_name}_{timestamp}.json"
 
 
-def format_action_payload(payload: dict) -> str:
-    ordered_keys = ["left_arm", "right_arm", "waist_leg", "duration"]
-    lines = ["{"]
+def next_available_project_path(base_name: str) -> Path:
+    candidate = SAVED_PROJECTS_ROOT / f"{base_name}.json"
+    if not candidate.exists():
+        return candidate
 
-    for index, key in enumerate(ordered_keys):
-        value = payload.get(key)
-        if isinstance(value, list):
-            rendered_value = json.dumps(value, ensure_ascii=False)
-        else:
-            rendered_value = json.dumps(value, ensure_ascii=False)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return SAVED_PROJECTS_ROOT / f"{base_name}_{timestamp}.json"
 
-        suffix = "," if index < len(ordered_keys) - 1 else ""
-        lines.append(f'  "{key}": {rendered_value}{suffix}')
 
-    lines.append("}\n")
-    return "\n".join(lines)
+def format_json_payload(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
 
 
 def parse_args() -> AppConfig:
