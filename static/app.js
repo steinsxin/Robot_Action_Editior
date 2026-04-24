@@ -293,6 +293,7 @@ const DEFAULT_PROJECT_DURATION = 12;
 const DEFAULT_CONTROL_HZ = 100;
 const KEYFRAME_KEYBOARD_NUDGE_SECONDS = 0.1;
 const KEYFRAME_DRAG_THRESHOLD_PX = 4;
+const IK_SEGMENT_BLEND_WINDOW_SECONDS = 0.12;
 const IK_SOLVE_INTERVAL_MS = 1000 / 30;
 const IK_JOINT_DIRTY_EPSILON = 1e-4;
 const IK_TRANSLATE_GIZMO_SIZE = 1;
@@ -485,6 +486,8 @@ let ikRequestInFlight = false;
 let pendingIkSolveKey = null;
 let activeIkHandleKey = null;
 let lastIkSolveQueuedAt = 0;
+let ikInterpolationCache = new Map();
+let ikInterpolationRequests = new Map();
 
 let projectState = createProjectState();
 selectedKeyframeId = projectState.actionKeyframes[0]?.id || null;
@@ -495,6 +498,7 @@ function createDefaultStartKeyframe() {
     label: '起始帧',
     time: 0,
     easing: 'easeInOut',
+    interpolationMode: 'joint',
     isStart: true,
     pose: createDefaultStartPoseSnapshot(),
   };
@@ -590,6 +594,7 @@ function sanitizeKeyframe(frame) {
     label: String(frame.label || '关键帧').trim() || '关键帧',
     time: clampNumber(frame.time, 0, Number.MAX_SAFE_INTEGER, 0),
     easing: EASING_MAP[frame.easing] ? frame.easing : 'easeInOut',
+    interpolationMode: frame.interpolationMode === 'ik' ? 'ik' : 'joint',
     isStart: Boolean(frame.isStart),
     pose: sanitizePoseSnapshot(frame.pose),
   };
@@ -2015,6 +2020,162 @@ function interpolatePoseSnapshots(leftPose, rightPose, rawProgress, easingName =
   };
 }
 
+function interpolateJointPositions(leftJoints, rightJoints, progress) {
+  const jointNames = new Set([...Object.keys(leftJoints || {}), ...Object.keys(rightJoints || {})]);
+  const joints = {};
+
+  for (const jointName of jointNames) {
+    const leftValue = Number(leftJoints?.[jointName]) || 0;
+    const rightValue = Number(rightJoints?.[jointName]) || 0;
+    joints[jointName] = THREE.MathUtils.lerp(leftValue, rightValue, progress);
+  }
+
+  return joints;
+}
+
+function getSegmentEasedProgress(rawProgress, easingName = 'easeInOut') {
+  const easing = EASING_MAP[easingName] || EASING_MAP.easeInOut;
+  return easing(THREE.MathUtils.clamp(rawProgress, 0, 1));
+}
+
+function smoothStep01(value) {
+  const clamped = THREE.MathUtils.clamp(value, 0, 1);
+  return clamped * clamped * (3 - 2 * clamped);
+}
+
+function getIkBlendWeight(segmentDuration, localTime) {
+  const blendWindow = Math.min(IK_SEGMENT_BLEND_WINDOW_SECONDS, segmentDuration * 0.5);
+  if (blendWindow <= 1e-6) {
+    return 1;
+  }
+
+  const blendIn = smoothStep01(localTime / blendWindow);
+  const blendOut = smoothStep01((segmentDuration - localTime) / blendWindow);
+  return Math.min(blendIn, blendOut);
+}
+
+function getIkInterpolationCacheKey(leftFrame, rightFrame) {
+  const leftPose = sanitizePoseSnapshot(leftFrame.pose);
+  const rightPose = sanitizePoseSnapshot(rightFrame.pose);
+  return JSON.stringify({
+    leftId: leftFrame.id,
+    rightId: rightFrame.id,
+    leftTime: Number(leftFrame.time.toFixed(3)),
+    rightTime: Number(rightFrame.time.toFixed(3)),
+    leftJoints: leftPose.joints,
+    rightJoints: rightPose.joints,
+    sampleHz: projectState.controlHz,
+  });
+}
+
+function sampleIkInterpolationFrames(frames, localTime) {
+  if (!Array.isArray(frames) || frames.length === 0) {
+    return null;
+  }
+
+  if (localTime <= frames[0].time) {
+    return { ...(frames[0].jointPositions || {}) };
+  }
+
+  for (let index = 0; index < frames.length - 1; index += 1) {
+    const leftSample = frames[index];
+    const rightSample = frames[index + 1];
+    if (localTime >= leftSample.time && localTime <= rightSample.time) {
+      const duration = Math.max(rightSample.time - leftSample.time, 0.0001);
+      const progress = (localTime - leftSample.time) / duration;
+      return interpolateJointPositions(leftSample.jointPositions || {}, rightSample.jointPositions || {}, progress);
+    }
+  }
+
+  return { ...(frames[frames.length - 1].jointPositions || {}) };
+}
+
+function buildIkInterpolationPayload(leftFrame, rightFrame) {
+  return {
+    leftJointPositions: sanitizePoseSnapshot(leftFrame.pose).joints,
+    rightJointPositions: sanitizePoseSnapshot(rightFrame.pose).joints,
+    sampleHz: projectState.controlHz,
+    duration: Math.max(rightFrame.time - leftFrame.time, 0.001),
+  };
+}
+
+function requestIkInterpolation(leftFrame, rightFrame) {
+  if (leftFrame.interpolationMode !== 'ik') {
+    return Promise.resolve(null);
+  }
+
+  const cacheKey = getIkInterpolationCacheKey(leftFrame, rightFrame);
+  if (ikInterpolationCache.has(cacheKey)) {
+    return Promise.resolve(ikInterpolationCache.get(cacheKey));
+  }
+
+  const pendingRequest = ikInterpolationRequests.get(cacheKey);
+  if (pendingRequest) {
+    return pendingRequest;
+  }
+
+  const request = fetch('/api/ik/interpolate-keyframes', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(buildIkInterpolationPayload(leftFrame, rightFrame)),
+  })
+    .then(async response => {
+      if (!response.ok) {
+        let errorDetail = `IK interpolation failed: ${response.status}`;
+        try {
+          const errorPayload = await response.json();
+          errorDetail = errorPayload.detail || errorPayload.message || errorPayload.error || errorDetail;
+        } catch {
+          // Keep the status fallback when the body is not JSON.
+        }
+        throw new Error(errorDetail);
+      }
+
+      const result = await response.json();
+      ikInterpolationCache.set(cacheKey, result);
+      if (!isPlaying && projectState.playhead >= leftFrame.time && projectState.playhead <= rightFrame.time) {
+        updatePlayhead(projectState.playhead);
+      }
+      return result;
+    })
+    .catch(error => {
+      console.error(error);
+      return null;
+    })
+    .finally(() => {
+      ikInterpolationRequests.delete(cacheKey);
+    });
+
+  ikInterpolationRequests.set(cacheKey, request);
+  return request;
+}
+
+function warmIkInterpolationCache() {
+  const frames = [...projectState.actionKeyframes].sort((left, right) => left.time - right.time);
+  for (let index = 0; index < frames.length - 1; index += 1) {
+    const leftFrame = frames[index];
+    const rightFrame = frames[index + 1];
+    if (leftFrame.interpolationMode === 'ik') {
+      requestIkInterpolation(leftFrame, rightFrame);
+    }
+  }
+}
+
+async function ensureIkInterpolationReady() {
+  const frames = [...projectState.actionKeyframes].sort((left, right) => left.time - right.time);
+  const requests = [];
+  for (let index = 0; index < frames.length - 1; index += 1) {
+    const leftFrame = frames[index];
+    const rightFrame = frames[index + 1];
+    if (leftFrame.interpolationMode === 'ik') {
+      requests.push(requestIkInterpolation(leftFrame, rightFrame));
+    }
+  }
+  await Promise.all(requests);
+}
+
 function evaluatePoseAtTime(time) {
   const frames = [...projectState.actionKeyframes].sort((left, right) => left.time - right.time);
   if (frames.length === 0) {
@@ -2029,13 +2190,30 @@ function evaluatePoseAtTime(time) {
     const rightFrame = frames[index + 1];
     if (time >= leftFrame.time && time <= rightFrame.time) {
       const segmentDuration = Math.max(rightFrame.time - leftFrame.time, 0.0001);
-      const progress = (time - leftFrame.time) / segmentDuration;
-      return interpolatePoseSnapshots(
+      const rawProgress = (time - leftFrame.time) / segmentDuration;
+      const basePose = interpolatePoseSnapshots(
         sanitizePoseSnapshot(leftFrame.pose),
         sanitizePoseSnapshot(rightFrame.pose),
-        progress,
+        rawProgress,
         leftFrame.easing,
       );
+
+      if (leftFrame.interpolationMode === 'ik') {
+        const cacheEntry = ikInterpolationCache.get(getIkInterpolationCacheKey(leftFrame, rightFrame));
+        if (cacheEntry?.frames?.length) {
+          const easedProgress = getSegmentEasedProgress(rawProgress, leftFrame.easing);
+          const ikJoints = sampleIkInterpolationFrames(cacheEntry.frames, easedProgress * segmentDuration);
+          if (ikJoints) {
+            const blendWeight = getIkBlendWeight(segmentDuration, rawProgress * segmentDuration);
+            return {
+              base: basePose.base,
+              joints: interpolateJointPositions(basePose.joints, ikJoints, blendWeight),
+            };
+          }
+        }
+      }
+
+      return basePose;
     }
   }
 
@@ -2285,7 +2463,7 @@ function renderActionTrack() {
     const currentFrame = frames[index];
     const nextFrame = frames[index + 1];
     const segment = document.createElement('div');
-    segment.className = 'keyframe-segment';
+    segment.className = `keyframe-segment${currentFrame.interpolationMode === 'ik' ? ' ik-segment' : ''}`;
     segment.style.left = `${currentFrame.time * TIMELINE_PIXELS_PER_SECOND}px`;
     segment.style.width = `${Math.max((nextFrame.time - currentFrame.time) * TIMELINE_PIXELS_PER_SECOND, 0)}px`;
     actionTrack.appendChild(segment);
@@ -2300,7 +2478,7 @@ function renderActionTrack() {
     node.innerHTML = `
       <strong>${frame.label}</strong>
       <span>${frame.time.toFixed(3)}s</span>
-      <small>${frame.easing}</small>
+      <small>${frame.easing} / ${frame.interpolationMode === 'ik' ? 'IK' : '关节'}</small>
     `;
     node.addEventListener('pointerdown', event => {
       event.stopPropagation();
@@ -2369,9 +2547,17 @@ function renderKeyframeInspector() {
         </select>
       </div>
     </div>
+    <div class="field">
+      <label for="kf-interpolation-mode">到下一关键帧的中间移动</label>
+      <select id="kf-interpolation-mode" ${keyframe === projectState.actionKeyframes[projectState.actionKeyframes.length - 1] ? 'disabled' : ''}>
+        <option value="joint" ${keyframe.interpolationMode !== 'ik' ? 'selected' : ''}>关节插值</option>
+        <option value="ik" ${keyframe.interpolationMode === 'ik' ? 'selected' : ''}>IK 轨迹结算</option>
+      </select>
+    </div>
     <div class="inspector-stats">
       <span>基座: x ${keyframe.pose.base.x.toFixed(2)}, y ${keyframe.pose.base.y.toFixed(2)}, z ${keyframe.pose.base.z.toFixed(2)}, yaw ${keyframe.pose.base.yaw.toFixed(2)}</span>
       <span>关节采样: ${Object.keys(keyframe.pose.joints || {}).length}</span>
+      <span>当前段模式: ${keyframe.interpolationMode === 'ik' ? 'IK 轨迹' : '关节插值'}</span>
     </div>
   `;
 
@@ -2392,7 +2578,12 @@ function renderKeyframeInspector() {
 
   keyframeInspector.querySelector('#kf-easing').addEventListener('change', event => {
     keyframe.easing = event.currentTarget.value;
-    renderActionTrack();
+    renderComposer();
+  });
+
+  keyframeInspector.querySelector('#kf-interpolation-mode').addEventListener('change', event => {
+    keyframe.interpolationMode = event.currentTarget.value === 'ik' ? 'ik' : 'joint';
+    renderComposer();
   });
 }
 
@@ -2469,6 +2660,7 @@ function renderComposer() {
   renderInspectors();
   renderSummary();
   updatePlayhead(projectState.playhead, { applyPose: Boolean(currentRobot) });
+  warmIkInterpolationCache();
 }
 
 function buildProjectPayload() {
@@ -2487,6 +2679,7 @@ function buildProjectPayload() {
       label: frame.label,
       time: Number(frame.time.toFixed(3)),
       easing: frame.easing,
+      interpolationMode: frame.interpolationMode,
       isStart: isStartKeyframe(frame),
       pose: sanitizePoseSnapshot(frame.pose),
     })),
@@ -2506,6 +2699,8 @@ function loadProjectPayload(payload, options = {}) {
   resolvePendingSelectedKeyframePose('加载其他项目');
   stopPlayback({ keepCurrentTime: false });
   projectState = createProjectState(payload);
+  ikInterpolationCache = new Map();
+  ikInterpolationRequests = new Map();
   currentProjectFileName = fileName;
   selectedKeyframeId = projectState.actionKeyframes[0]?.id || null;
   selectedVoiceClipId = null;
@@ -2518,6 +2713,8 @@ function createNewProject() {
   resolvePendingSelectedKeyframePose('新建工程');
   stopPlayback({ keepCurrentTime: false });
   projectState = createProjectState();
+  ikInterpolationCache = new Map();
+  ikInterpolationRequests = new Map();
   currentProjectFileName = null;
   selectedKeyframeId = projectState.actionKeyframes[0]?.id || null;
   selectedVoiceClipId = null;
@@ -2611,17 +2808,23 @@ function downloadJson(fileName, payload) {
   URL.revokeObjectURL(url);
 }
 
-function exportPlan() {
+async function exportPlan() {
   resolvePendingSelectedKeyframePose('导出计划');
   if (projectState.actionKeyframes.length === 0) {
     setStatus('至少需要一个关键帧后才能导出运动计划。', true);
     return;
   }
 
-  const payload = buildExportPlan();
-  const safeTitle = projectState.title.replace(/[^a-z0-9_-]+/gi, '_').replace(/^_+|_+$/g, '') || 'robot_plan';
-  downloadJson(`${safeTitle}_100hz_plan.json`, payload);
-  setStatus(`已导出 100Hz 计划，共 ${payload.motionPlan.frames.length} 帧。`);
+  try {
+    await ensureIkInterpolationReady();
+    const payload = buildExportPlan();
+    const safeTitle = projectState.title.replace(/[^a-z0-9_-]+/gi, '_').replace(/^_+|_+$/g, '') || 'robot_plan';
+    downloadJson(`${safeTitle}_100hz_plan.json`, payload);
+    setStatus(`已导出 100Hz 计划，共 ${payload.motionPlan.frames.length} 帧。`);
+  } catch (error) {
+    console.error(error);
+    setStatus(`导出失败: ${error.message}`, true);
+  }
 }
 
 function loadSelectedAction() {

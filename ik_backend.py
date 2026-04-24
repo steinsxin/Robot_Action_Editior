@@ -66,6 +66,16 @@ def _as_float_array(values: list[float], size: int, field_name: str) -> np.ndarr
     return np.array([float(value) for value in values], dtype=np.float64)
 
 
+def _as_joint_positions(payload: dict, field_name: str) -> dict[str, float]:
+    if not isinstance(payload, dict):
+        raise ValueError(f"{field_name} must be an object")
+
+    positions: dict[str, float] = {}
+    for joint_name, value in payload.items():
+        positions[str(joint_name)] = float(value)
+    return positions
+
+
 @dataclass(frozen=True)
 class TargetPose:
     position: np.ndarray
@@ -120,6 +130,18 @@ class DualArmIkService:
 
         with self._lock:
             return self._solve_locked(joint_positions, left_target, right_target)
+
+    def interpolate_keyframes(self, payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            raise ValueError("Payload must be an object")
+
+        left_joint_positions = _as_joint_positions(payload.get("leftJointPositions") or {}, "leftJointPositions")
+        right_joint_positions = _as_joint_positions(payload.get("rightJointPositions") or {}, "rightJointPositions")
+        sample_hz = min(200, max(4, int(payload.get("sampleHz") or 30)))
+        duration = max(0.001, float(payload.get("duration") or 1.0))
+
+        with self._lock:
+            return self._interpolate_keyframes_locked(left_joint_positions, right_joint_positions, sample_hz, duration)
 
     def _solve_locked(self, joint_positions: dict, left_target: TargetPose, right_target: TargetPose) -> dict:
         arm_model_q = self._build_configuration(self._arm_model, ARM_MODEL_JOINTS, joint_positions)
@@ -176,6 +198,116 @@ class DualArmIkService:
                 "right": self._frame_pose_payload(reduced_data.oMf[right_frame_id]),
             },
         }
+
+    def _interpolate_keyframes_locked(
+        self,
+        left_joint_positions: dict[str, float],
+        right_joint_positions: dict[str, float],
+        sample_hz: int,
+        duration: float,
+    ) -> dict:
+        left_targets = self._forward_targets(left_joint_positions)
+        right_targets = self._forward_targets(right_joint_positions)
+        total_samples = max(2, int(round(duration * sample_hz)) + 1)
+        solved_joint_positions = dict(left_joint_positions)
+        frames: list[dict] = [
+            {
+                "time": 0.0,
+                "jointPositions": dict(left_joint_positions),
+            }
+        ]
+        success_count = 0
+
+        for index in range(1, total_samples - 1):
+            progress = index / (total_samples - 1)
+            interpolated_left = self._interpolate_target_pose(left_targets["left"], right_targets["left"], progress)
+            interpolated_right = self._interpolate_target_pose(left_targets["right"], right_targets["right"], progress)
+            solve_result = self._solve_locked(solved_joint_positions, interpolated_left, interpolated_right)
+            solved_joint_positions = {**solved_joint_positions, **solve_result["jointPositions"]}
+            success_count += int(bool(solve_result["success"]))
+            frames.append(
+                {
+                    "time": float(duration * progress),
+                    "jointPositions": dict(solved_joint_positions),
+                }
+            )
+
+        frames.append(
+            {
+                "time": float(duration),
+                "jointPositions": dict(right_joint_positions),
+            }
+        )
+
+        return {
+            "ok": True,
+            "sampleHz": sample_hz,
+            "duration": duration,
+            "frames": frames,
+            "successCount": success_count,
+            "totalFrames": len(frames),
+        }
+
+    def _forward_targets(self, joint_positions: dict[str, float]) -> dict[str, TargetPose]:
+        arm_model_q = self._build_configuration(self._arm_model, ARM_MODEL_JOINTS, joint_positions)
+        reduced_model = pin.buildReducedModel(self._arm_model, self._dual_lock_ids, arm_model_q)
+        reduced_data = reduced_model.createData()
+
+        q = self._build_configuration(reduced_model, DUAL_ACTIVE_JOINTS, joint_positions)
+        pin.forwardKinematics(reduced_model, reduced_data, q)
+
+        left_frame_id = reduced_model.getFrameId(LEFT_TARGET_LINK)
+        right_frame_id = reduced_model.getFrameId(RIGHT_TARGET_LINK)
+        pin.updateFramePlacement(reduced_model, reduced_data, left_frame_id)
+        pin.updateFramePlacement(reduced_model, reduced_data, right_frame_id)
+
+        return {
+            "left": self._target_pose_from_placement(reduced_data.oMf[left_frame_id]),
+            "right": self._target_pose_from_placement(reduced_data.oMf[right_frame_id]),
+        }
+
+    def _target_pose_from_placement(self, placement: pin.SE3) -> TargetPose:
+        quaternion = pin.Quaternion(placement.rotation)
+        return TargetPose(
+            position=placement.translation.astype(np.float64),
+            quaternion=np.array(
+                [
+                    float(quaternion.x),
+                    float(quaternion.y),
+                    float(quaternion.z),
+                    float(quaternion.w),
+                ],
+                dtype=np.float64,
+            ),
+        )
+
+    def _interpolate_target_pose(self, start_pose: TargetPose, end_pose: TargetPose, progress: float) -> TargetPose:
+        clamped = min(max(progress, 0.0), 1.0)
+        return TargetPose(
+            position=(1.0 - clamped) * start_pose.position + clamped * end_pose.position,
+            quaternion=self._slerp_quaternion(start_pose.quaternion, end_pose.quaternion, clamped),
+        )
+
+    def _slerp_quaternion(self, start_quaternion: np.ndarray, end_quaternion: np.ndarray, progress: float) -> np.ndarray:
+        start = start_quaternion / max(np.linalg.norm(start_quaternion), 1e-8)
+        end = end_quaternion / max(np.linalg.norm(end_quaternion), 1e-8)
+        dot = float(np.dot(start, end))
+
+        if dot < 0.0:
+            end = -end
+            dot = -dot
+
+        if dot > 0.9995:
+            blended = start + progress * (end - start)
+            return blended / max(np.linalg.norm(blended), 1e-8)
+
+        theta_0 = float(np.arccos(np.clip(dot, -1.0, 1.0)))
+        sin_theta_0 = float(np.sin(theta_0))
+        theta = theta_0 * progress
+        sin_theta = float(np.sin(theta))
+        scale_start = float(np.sin(theta_0 - theta) / sin_theta_0)
+        scale_end = float(sin_theta / sin_theta_0)
+        return scale_start * start + scale_end * end
 
     def _build_configuration(self, model: pin.Model, joint_names: list[str], joint_positions: dict) -> np.ndarray:
         q = np.zeros(model.nq, dtype=np.float64)

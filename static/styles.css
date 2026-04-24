@@ -677,6 +677,13 @@ button.playing,
   pointer-events: none;
 }
 
+.keyframe-segment.ik-segment {
+  height: 6px;
+  top: 25px;
+  background: linear-gradient(90deg, rgba(118, 224, 160, 0.42), rgba(114, 212, 221, 0.82));
+  box-shadow: 0 0 0 1px rgba(118, 224, 160, 0.22);
+}
+
 .track-item strong,
 .track-item span,
 .track-item small {

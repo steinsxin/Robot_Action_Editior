@@ -305,6 +305,10 @@ class RobotViewerHandler(BaseHTTPRequestHandler):
             self.handle_ik_solve()
             return
 
+        if request_path == "/api/ik/interpolate-keyframes":
+            self.handle_ik_interpolate_keyframes()
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def log_message(self, format: str, *args) -> None:
@@ -447,6 +451,36 @@ class RobotViewerHandler(BaseHTTPRequestHandler):
             return
         except Exception as error:
             self.serve_json_error(HTTPStatus.INTERNAL_SERVER_ERROR, "IK solve failed", detail=str(error))
+            return
+
+        self.serve_json(result)
+
+    def handle_ik_interpolate_keyframes(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self.serve_json_error(HTTPStatus.BAD_REQUEST, "Invalid JSON body")
+            return
+
+        if not isinstance(payload, dict):
+            self.serve_json_error(HTTPStatus.BAD_REQUEST, "Payload must be an object")
+            return
+
+        try:
+            if self.__class__.ik_service is None:
+                from ik_backend import DualArmIkService
+
+                self.__class__.ik_service = DualArmIkService()
+
+            result = self.__class__.ik_service.interpolate_keyframes(payload)
+        except ValueError as error:
+            self.serve_json_error(HTTPStatus.BAD_REQUEST, str(error), detail=str(error))
+            return
+        except Exception as error:
+            self.serve_json_error(HTTPStatus.INTERNAL_SERVER_ERROR, "IK interpolation failed", detail=str(error))
             return
 
         self.serve_json(result)
