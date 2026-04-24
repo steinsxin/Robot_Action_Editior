@@ -37,13 +37,18 @@ app.innerHTML = `
             </div>
             <div class="transport-buttons compact-transport">
               <button id="reload-button" type="button">重载模型</button>
-              <button id="drag-toggle" type="button">拖拽模型：关闭</button>
+              <button id="drag-toggle" type="button">拖拽基座：关闭</button>
+              <button id="ik-toggle" type="button">IK 拖手：关闭</button>
+              <button id="ik-left" type="button" disabled>左手目标</button>
+              <button id="ik-right" type="button" disabled>右手目标</button>
               <button id="reset-camera" type="button">重置视角</button>
               <button id="reset-pose" type="button">关节归零</button>
               <button id="play-toggle" type="button" class="accent">播放</button>
               <button id="stop-playback" type="button">停止</button>
             </div>
           </div>
+
+          <p id="status" class="status">正在读取机器人配置…</p>
 
           <div class="project-state-fields" hidden>
             <input id="project-title" type="hidden" value="untitled_project" />
@@ -52,7 +57,6 @@ app.innerHTML = `
             <input id="motion-topic" type="hidden" value="/robot/motion_plan" />
             <input id="voice-topic" type="hidden" value="/robot/tts_plan" />
             <input id="browser-voice-toggle" type="checkbox" checked hidden />
-            <p id="status">正在读取机器人配置…</p>
             <strong id="urdf-path"></strong>
             <strong id="keyframe-count">0</strong>
             <strong id="voice-count">0</strong>
@@ -232,6 +236,9 @@ const motionTopicInput = document.querySelector('#motion-topic');
 const voiceTopicInput = document.querySelector('#voice-topic');
 const reloadButton = document.querySelector('#reload-button');
 const dragToggleButton = document.querySelector('#drag-toggle');
+const ikToggleButton = document.querySelector('#ik-toggle');
+const ikLeftButton = document.querySelector('#ik-left');
+const ikRightButton = document.querySelector('#ik-right');
 const resetCameraButton = document.querySelector('#reset-camera');
 const resetPoseButton = document.querySelector('#reset-pose');
 const playToggleButton = document.querySelector('#play-toggle');
@@ -282,6 +289,30 @@ const TIMELINE_PIXELS_PER_SECOND = 96;
 const PROJECT_MIN_DURATION = 1;
 const DEFAULT_PROJECT_DURATION = 12;
 const DEFAULT_CONTROL_HZ = 100;
+const KEYFRAME_KEYBOARD_NUDGE_SECONDS = 0.1;
+const KEYFRAME_DRAG_THRESHOLD_PX = 4;
+const IK_SOLVE_INTERVAL_MS = 1000 / 30;
+const IK_TRANSLATE_GIZMO_SIZE = 1;
+const IK_ROTATE_GIZMO_SIZE = 0.8;
+const IK_TARGET_LINKS = {
+  left: 'Link_Left_Wrist_Lower_to_Gripper',
+  right: 'Link_Right_Wrist_Lower_to_Gripper',
+};
+
+const IK_TARGET_CONFIGS = {
+  left: {
+    label: '左手目标',
+    color: '#7ae582',
+    linkName: IK_TARGET_LINKS.left,
+    visualOffset: [0.055, 0, 0],
+  },
+  right: {
+    label: '右手目标',
+    color: '#ff9f68',
+    linkName: IK_TARGET_LINKS.right,
+    visualOffset: [0.055, 0, 0],
+  },
+};
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color('#09111d');
@@ -304,7 +335,27 @@ const transformControls = new TransformControls(camera, renderer.domElement);
 transformControls.setMode('translate');
 transformControls.setSpace('world');
 transformControls.visible = false;
-scene.add(transformControls);
+const transformControlsHelper = transformControls.getHelper();
+scene.add(transformControlsHelper);
+
+const ikTransformControls = new TransformControls(camera, renderer.domElement);
+ikTransformControls.setMode('translate');
+ikTransformControls.setSpace('world');
+ikTransformControls.setSize(IK_TRANSLATE_GIZMO_SIZE);
+ikTransformControls.visible = false;
+const ikTransformControlsHelper = ikTransformControls.getHelper();
+scene.add(ikTransformControlsHelper);
+
+const ikRotateTransformControls = new TransformControls(camera, renderer.domElement);
+ikRotateTransformControls.setMode('rotate');
+ikRotateTransformControls.setSpace('local');
+ikRotateTransformControls.visible = false;
+ikRotateTransformControls.setSize(IK_ROTATE_GIZMO_SIZE);
+const ikRotateTransformControlsHelper = ikRotateTransformControls.getHelper();
+scene.add(ikRotateTransformControlsHelper);
+
+const ikTargetGroup = new THREE.Group();
+scene.add(ikTargetGroup);
 
 const hemiLight = new THREE.HemisphereLight('#b4d8ff', '#10243d', 1.18);
 scene.add(hemiLight);
@@ -366,6 +417,25 @@ const ACTION_GROUPS = {
   ],
 };
 
+const DEFAULT_START_ARM_ANGLES_DEGREES = {
+  left_arm: [20, 0, 0, 110, 0, 0, 0],
+  right_arm: [-20, 0, 0, -110, 0, 0, 0],
+};
+
+function createDefaultStartPoseSnapshot() {
+  const joints = {};
+
+  for (const [groupName, jointNames] of Object.entries(ACTION_GROUPS)) {
+    const defaultAngles = DEFAULT_START_ARM_ANGLES_DEGREES[groupName] || [];
+    jointNames.forEach((jointName, index) => {
+      const degrees = Number(defaultAngles[index]);
+      joints[jointName] = Number.isFinite(degrees) ? THREE.MathUtils.degToRad(degrees) : 0;
+    });
+  }
+
+  return sanitizePoseSnapshot({ joints });
+}
+
 const EASING_MAP = {
   linear: value => value,
   easeInOut: value => (value < 0.5 ? 4 * value * value * value : 1 - Math.pow(-2 * value + 2, 3) / 2),
@@ -402,6 +472,15 @@ let selectedKeyframeId = null;
 let selectedVoiceClipId = null;
 let pendingSelectedKeyframePoseSave = false;
 let activeJointDrawerGroupKey = null;
+let activeKeyframeDrag = null;
+let ikEnabled = false;
+let ikTransformDragging = false;
+let ikTranslateDragging = false;
+let ikRotateDragging = false;
+let ikRequestInFlight = false;
+let pendingIkSolveKey = null;
+let activeIkHandleKey = null;
+let lastIkSolveQueuedAt = 0;
 
 let projectState = createProjectState();
 selectedKeyframeId = projectState.actionKeyframes[0]?.id || null;
@@ -413,7 +492,7 @@ function createDefaultStartKeyframe() {
     time: 0,
     easing: 'easeInOut',
     isStart: true,
-    pose: sanitizePoseSnapshot(),
+    pose: createDefaultStartPoseSnapshot(),
   };
 }
 
@@ -428,6 +507,48 @@ transformControls.addEventListener('dragging-changed', event => {
 transformControls.addEventListener('objectChange', () => {
   syncBaseInputs();
   markSelectedKeyframePoseDirty();
+});
+
+ikTransformControls.addEventListener('dragging-changed', event => {
+  ikTranslateDragging = event.value;
+  ikTransformDragging = ikTranslateDragging || ikRotateDragging;
+  ikRotateTransformControls.enabled = !event.value;
+  syncInteractionState();
+  if (event.value && activeIkHandleKey) {
+    setStatus(`正在平移${IK_TARGET_CONFIGS[activeIkHandleKey].label}，松开后会自动求解 IK。`);
+  }
+  if (!event.value && activeIkHandleKey) {
+    ikRotateTransformControls.enabled = true;
+    queueIkSolve(activeIkHandleKey, { announce: true });
+  }
+});
+
+ikTransformControls.addEventListener('objectChange', () => {
+  if (!activeIkHandleKey) {
+    return;
+  }
+  queueIkSolve(activeIkHandleKey);
+});
+
+ikRotateTransformControls.addEventListener('dragging-changed', event => {
+  ikRotateDragging = event.value;
+  ikTransformDragging = ikTranslateDragging || ikRotateDragging;
+  ikTransformControls.enabled = !event.value;
+  syncInteractionState();
+  if (event.value && activeIkHandleKey) {
+    setStatus(`正在旋转${IK_TARGET_CONFIGS[activeIkHandleKey].label}，松开后会自动求解 IK。`);
+  }
+  if (!event.value && activeIkHandleKey) {
+    ikTransformControls.enabled = true;
+    queueIkSolve(activeIkHandleKey, { announce: true });
+  }
+});
+
+ikRotateTransformControls.addEventListener('objectChange', () => {
+  if (!activeIkHandleKey) {
+    return;
+  }
+  queueIkSolve(activeIkHandleKey);
 });
 
 function createProjectState(overrides = {}) {
@@ -585,6 +706,125 @@ function selectVoiceClip(clipId) {
   renderActionTrack();
 }
 
+function moveKeyframe(frameId, nextTime, options = {}) {
+  const { silent = false } = options;
+  const keyframe = projectState.actionKeyframes.find(frame => frame.id === frameId);
+  if (!keyframe || isStartKeyframe(keyframe)) {
+    return false;
+  }
+
+  const clampedTime = clampNumber(nextTime, 0, projectState.duration, keyframe.time);
+  const roundedTime = Math.round(clampedTime * 1000) / 1000;
+  if (Math.abs(roundedTime - keyframe.time) <= 0.0001) {
+    return false;
+  }
+
+  keyframe.time = roundedTime;
+  sortKeyframes();
+  updatePlayhead(keyframe.time);
+  renderComposer();
+
+  if (!silent) {
+    setStatus(`已将关键帧 ${keyframe.label} 移动到 ${keyframe.time.toFixed(3)}s。`);
+  }
+
+  return true;
+}
+
+function nudgeSelectedKeyframe(deltaSeconds) {
+  const keyframe = getSelectedKeyframe();
+  if (!keyframe) {
+    return false;
+  }
+
+  if (isStartKeyframe(keyframe)) {
+    setStatus('起始帧固定在 0s，不能移动。', true);
+    return true;
+  }
+
+  const moved = moveKeyframe(keyframe.id, keyframe.time + deltaSeconds);
+  if (!moved) {
+    setStatus(`关键帧 ${keyframe.label} 已经到达可移动边界。`, true);
+  }
+  return true;
+}
+
+function endActiveKeyframeDrag() {
+  if (!activeKeyframeDrag) {
+    return;
+  }
+
+  const { frameId, moved } = activeKeyframeDrag;
+  const keyframe = projectState.actionKeyframes.find(frame => frame.id === frameId);
+  activeKeyframeDrag = null;
+
+  if (moved && keyframe) {
+    setStatus(`已将关键帧 ${keyframe.label} 拖拽到 ${keyframe.time.toFixed(3)}s。`);
+  }
+}
+
+function beginKeyframeDrag(event, frameId) {
+  if (event.button !== 0) {
+    return;
+  }
+
+  const keyframe = projectState.actionKeyframes.find(frame => frame.id === frameId);
+  if (!keyframe) {
+    return;
+  }
+
+  if (selectedKeyframeId !== frameId) {
+    selectKeyframe(frameId);
+  }
+
+  activeKeyframeDrag = {
+    frameId,
+    pointerId: event.pointerId,
+    startClientX: event.clientX,
+    startTime: keyframe.time,
+    moved: false,
+  };
+
+  event.currentTarget.setPointerCapture?.(event.pointerId);
+
+  const handlePointerMove = moveEvent => {
+    if (!activeKeyframeDrag || moveEvent.pointerId !== activeKeyframeDrag.pointerId) {
+      return;
+    }
+
+    const deltaX = moveEvent.clientX - activeKeyframeDrag.startClientX;
+    if (!activeKeyframeDrag.moved && Math.abs(deltaX) < KEYFRAME_DRAG_THRESHOLD_PX) {
+      return;
+    }
+
+    activeKeyframeDrag.moved = true;
+    const nextTime = activeKeyframeDrag.startTime + deltaX / TIMELINE_PIXELS_PER_SECOND;
+    moveKeyframe(activeKeyframeDrag.frameId, nextTime, { silent: true });
+  };
+
+  const handlePointerEnd = endEvent => {
+    if (!activeKeyframeDrag || endEvent.pointerId !== activeKeyframeDrag.pointerId) {
+      return;
+    }
+
+    window.removeEventListener('pointermove', handlePointerMove);
+    window.removeEventListener('pointerup', handlePointerEnd);
+    window.removeEventListener('pointercancel', handlePointerEnd);
+
+    try {
+      event.currentTarget.releasePointerCapture?.(endEvent.pointerId);
+    } catch {
+      // Ignore release failures when the pointer is already gone.
+    }
+
+    endActiveKeyframeDrag();
+  };
+
+  window.addEventListener('pointermove', handlePointerMove);
+  window.addEventListener('pointerup', handlePointerEnd);
+  window.addEventListener('pointercancel', handlePointerEnd);
+}
+
 function sanitizeVoiceClip(clip) {
   return {
     id: clip.id || createId('vc'),
@@ -706,18 +946,305 @@ function clearRobot() {
     transformControls.detach();
     robotGroup.remove(currentRobot);
   }
+  ikTransformControls.detach();
+  ikTransformControls.visible = false;
+  ikRotateTransformControls.detach();
+  ikRotateTransformControls.visible = false;
   currentRobot = null;
   jointControllers = [];
   jointWidgets.clear();
   jointListNode.innerHTML = '<div class="empty-state">模型加载后，这里会生成身体模块按钮。点击一个模块后，会从右侧展开对应的关节控制抽屉。</div>';
   jointCountNode.textContent = '0 joints';
   closeJointDrawer();
+  syncIkTargetButtons();
+  syncIkHandleTargets();
 }
 
 function syncInteractionState() {
   const sliderDragging = sliderDragCount > 0;
-  orbitControls.enabled = !transformDragging && !sliderDragging;
+  orbitControls.enabled = !transformDragging && !ikTransformDragging && !sliderDragging;
   document.body.classList.toggle('slider-dragging', sliderDragging);
+}
+
+function createIkHandle(key, config) {
+  const handle = new THREE.Group();
+  handle.name = `ik-handle-${key}`;
+  handle.visible = false;
+  handle.userData = { key };
+
+  const core = new THREE.Mesh(
+    new THREE.SphereGeometry(0.045, 20, 20),
+    new THREE.MeshStandardMaterial({
+      color: config.color,
+      emissive: config.color,
+      emissiveIntensity: 0.35,
+      roughness: 0.35,
+      metalness: 0.1,
+    })
+  );
+
+  const ring = new THREE.Mesh(
+    new THREE.TorusGeometry(0.07, 0.008, 12, 32),
+    new THREE.MeshStandardMaterial({
+      color: '#f4fbff',
+      emissive: '#f4fbff',
+      emissiveIntensity: 0.12,
+      roughness: 0.25,
+      metalness: 0.32,
+    })
+  );
+  ring.rotation.x = Math.PI / 2;
+
+  handle.add(core);
+  handle.add(ring);
+  ikTargetGroup.add(handle);
+  return handle;
+}
+
+const ikHandles = new Map(Object.entries(IK_TARGET_CONFIGS).map(([key, config]) => [key, createIkHandle(key, config)]));
+
+function getRobotLinkObject(linkName) {
+  if (!currentRobot) {
+    return null;
+  }
+
+  return currentRobot.links?.[linkName] || currentRobot.getObjectByName(linkName) || null;
+}
+
+function getIkVisualOffset(config) {
+  const [x = 0, y = 0, z = 0] = config.visualOffset || [];
+  return new THREE.Vector3(x, y, z);
+}
+
+function syncIkTargetButtons() {
+  const enabled = ikEnabled && Boolean(currentRobot);
+  ikLeftButton.disabled = !enabled;
+  ikRightButton.disabled = !enabled;
+  ikLeftButton.classList.toggle('active', enabled && activeIkHandleKey === 'left');
+  ikRightButton.classList.toggle('active', enabled && activeIkHandleKey === 'right');
+}
+
+function syncIkHandleTargets(options = {}) {
+  const { preserveActive = false } = options;
+  const missingLinks = [];
+
+  for (const [key, config] of Object.entries(IK_TARGET_CONFIGS)) {
+    const handle = ikHandles.get(key);
+    if (!handle) {
+      continue;
+    }
+
+    handle.visible = ikEnabled && Boolean(currentRobot);
+    if (!handle.visible) {
+      continue;
+    }
+
+    if (preserveActive && key === activeIkHandleKey) {
+      continue;
+    }
+
+    const link = getRobotLinkObject(config.linkName);
+    if (!link) {
+      handle.visible = false;
+      missingLinks.push(config.linkName);
+      continue;
+    }
+
+    link.updateMatrixWorld(true);
+    const worldQuaternion = link.getWorldQuaternion(new THREE.Quaternion());
+    const worldPosition = link.localToWorld(getIkVisualOffset(config));
+    handle.position.copy(worldPosition);
+    handle.quaternion.copy(worldQuaternion);
+  }
+
+  syncIkTargetButtons();
+
+  if (ikEnabled && missingLinks.length > 0) {
+    setStatus(`IK 目标未挂到模型节点: ${missingLinks.join(', ')}`, true);
+  }
+}
+
+function selectIkHandle(key) {
+  if (!ikEnabled || !currentRobot) {
+    setStatus('IK 还没有开启，或模型尚未加载完成。', true);
+    return;
+  }
+
+  const handle = ikHandles.get(key);
+  if (!handle || !handle.visible) {
+    setStatus(`没有找到${IK_TARGET_CONFIGS[key].label}对应的可拖拽目标，请先检查模型节点是否解析成功。`, true);
+    return;
+  }
+
+  activeIkHandleKey = key;
+  ikTransformControls.enabled = true;
+  ikTransformControls.attach(handle);
+  ikTransformControls.visible = true;
+  ikRotateTransformControls.enabled = true;
+  ikRotateTransformControls.attach(handle);
+  ikRotateTransformControls.visible = true;
+  syncIkTargetButtons();
+  setStatus(`已选中${IK_TARGET_CONFIGS[key].label}，拖箭头或中心只会平移，拖旋转环才会改变朝向。`);
+}
+
+function buildIkSolvePayload() {
+  const robotQuaternion = robotGroup.getWorldQuaternion(new THREE.Quaternion());
+  const robotQuaternionInverse = robotQuaternion.clone().invert();
+  const jointPositions = Object.fromEntries(jointControllers.map(joint => [joint.name, Number.isFinite(joint.angle) ? joint.angle : 0]));
+  const targets = {};
+
+  for (const [key, handle] of ikHandles.entries()) {
+    const config = IK_TARGET_CONFIGS[key];
+    const worldPosition = handle.getWorldPosition(new THREE.Vector3());
+    const worldQuaternion = handle.getWorldQuaternion(new THREE.Quaternion());
+    const offsetInWorld = getIkVisualOffset(config).applyQuaternion(worldQuaternion);
+    const targetWorldPosition = worldPosition.clone().sub(offsetInWorld);
+    const localPosition = robotGroup.worldToLocal(targetWorldPosition);
+    const localQuaternion = robotQuaternionInverse.clone().multiply(worldQuaternion).normalize();
+
+    targets[key] = {
+      position: localPosition.toArray(),
+      quaternion: [localQuaternion.x, localQuaternion.y, localQuaternion.z, localQuaternion.w],
+    };
+  }
+
+  return { jointPositions, targets };
+}
+
+function isIkDragging() {
+  return ikTranslateDragging || ikRotateDragging;
+}
+
+function applyIkJointPositions(jointPositions) {
+  if (!currentRobot || !jointPositions || typeof jointPositions !== 'object') {
+    return;
+  }
+
+  const jointMap = new Map(jointControllers.map(joint => [joint.name, joint]));
+  let appliedCount = 0;
+
+  for (const [jointName, angle] of Object.entries(jointPositions)) {
+    const joint = jointMap.get(jointName);
+    if (!joint || !Number.isFinite(Number(angle))) {
+      continue;
+    }
+
+    const nextAngle = Number(angle);
+    joint.setJointValue(nextAngle);
+    updateJointWidget(jointName, nextAngle);
+    appliedCount += 1;
+  }
+
+  if (appliedCount > 0) {
+    currentRobot.updateMatrixWorld(true);
+    robotGroup.updateMatrixWorld(true);
+    markSelectedKeyframePoseDirty();
+  }
+}
+
+async function flushIkSolveQueue() {
+  if (ikRequestInFlight || !pendingIkSolveKey || !ikEnabled || !currentRobot || isPlaying) {
+    return;
+  }
+
+  const solveKey = pendingIkSolveKey;
+  pendingIkSolveKey = null;
+  ikRequestInFlight = true;
+
+  try {
+    const response = await fetch('/api/ik/solve', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(buildIkSolvePayload()),
+    });
+
+    if (!response.ok) {
+      let errorDetail = `IK request failed: ${response.status}`;
+      try {
+        const errorPayload = await response.json();
+        errorDetail = errorPayload.detail || errorPayload.message || errorPayload.error || errorDetail;
+      } catch {
+        // Keep the status-based fallback when the response body is not JSON.
+      }
+      throw new Error(errorDetail);
+    }
+
+    const result = await response.json();
+    applyIkJointPositions(result.jointPositions);
+    syncIkHandleTargets({ preserveActive: isIkDragging() });
+    if (!result.success) {
+      setStatus(`IK 未完全收敛，已返回当前最优姿态。迭代次数: ${result.iterations}`);
+    }
+  } catch (error) {
+    console.error(error);
+    setStatus(`IK 求解失败: ${error.message}`, true);
+  } finally {
+    ikRequestInFlight = false;
+    if (pendingIkSolveKey) {
+      flushIkSolveQueue();
+    }
+  }
+}
+
+function queueIkSolve(handleKey, options = {}) {
+  const { announce = false } = options;
+  if (!ikEnabled || !currentRobot || !handleKey || isPlaying) {
+    return;
+  }
+
+  pendingIkSolveKey = handleKey;
+  if (announce) {
+    setStatus(`${IK_TARGET_CONFIGS[handleKey].label}目标已变化，正在请求 IK 求解…`);
+  }
+  flushIkSolveQueue();
+}
+
+function tickContinuousIkSolve(timestamp) {
+  if (!ikEnabled || !currentRobot || !activeIkHandleKey || isPlaying) {
+    return;
+  }
+
+  if (timestamp - lastIkSolveQueuedAt < IK_SOLVE_INTERVAL_MS) {
+    return;
+  }
+
+  lastIkSolveQueuedAt = timestamp;
+  queueIkSolve(activeIkHandleKey);
+}
+
+function setIkMode(nextEnabled) {
+  ikEnabled = nextEnabled;
+  ikToggleButton.classList.toggle('active', ikEnabled);
+  ikToggleButton.textContent = `IK 拖手：${ikEnabled ? '开启' : '关闭'}`;
+
+  if (!ikEnabled) {
+    pendingIkSolveKey = null;
+    activeIkHandleKey = null;
+    ikTransformDragging = false;
+    ikTranslateDragging = false;
+    ikRotateDragging = false;
+    lastIkSolveQueuedAt = 0;
+    ikTransformControls.detach();
+    ikTransformControls.visible = false;
+    ikRotateTransformControls.detach();
+    ikRotateTransformControls.visible = false;
+    syncIkHandleTargets();
+    syncIkTargetButtons();
+    return;
+  }
+
+  if (dragEnabled) {
+    setDragMode(false);
+  }
+
+  syncIkHandleTargets();
+  selectIkHandle(activeIkHandleKey || 'left');
+}
+
+function toggleIkMode() {
+  setIkMode(!ikEnabled);
 }
 
 function attachSliderInteractionGuards(slider) {
@@ -859,6 +1386,10 @@ function getJointGroupByKey(groupKey) {
 }
 
 function closeJointDrawer() {
+  if (!activeJointDrawerGroupKey) {
+    return;
+  }
+
   activeJointDrawerGroupKey = null;
   jointWidgets.clear();
   jointDrawer.classList.remove('open');
@@ -1233,6 +1764,9 @@ async function loadRobot() {
       applyPoseSnapshot(previewPose);
     }
 
+    syncIkHandleTargets();
+    syncIkTargetButtons();
+
     setStatus(`已加载 ${modelSelect.value} / ${fileSelect.value}，meshes: ${meshCount}，size: ${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)}，radius: ${radius.toFixed(2)}`);
   } catch (error) {
     console.error(error);
@@ -1319,6 +1853,9 @@ function applyPoseSnapshot(snapshot) {
 
   currentRobot.updateMatrixWorld(true);
   robotGroup.updateMatrixWorld(true);
+  if (ikEnabled && !ikTransformDragging) {
+    syncIkHandleTargets();
+  }
 }
 
 function sortKeyframes() {
@@ -1738,6 +2275,7 @@ function renderActionTrack() {
     const node = document.createElement('button');
     node.type = 'button';
     node.className = `track-item keyframe-item${isStartKeyframe(frame) ? ' start-keyframe' : ''}${frame.id === selectedKeyframeId ? ' selected' : ''}`;
+    node.dataset.frameId = frame.id;
     node.style.left = `${frame.time * TIMELINE_PIXELS_PER_SECOND}px`;
     node.innerHTML = `
       <strong>${frame.label}</strong>
@@ -1746,6 +2284,7 @@ function renderActionTrack() {
     `;
     node.addEventListener('pointerdown', event => {
       event.stopPropagation();
+      beginKeyframeDrag(event, frame.id);
     });
     node.addEventListener('click', event => {
       event.stopPropagation();
@@ -2093,6 +2632,9 @@ function resetPose() {
   }
 
   markSelectedKeyframePoseDirty();
+  if (ikEnabled) {
+    syncIkHandleTargets();
+  }
 }
 
 function isEditableElement(target) {
@@ -2103,12 +2645,15 @@ function isEditableElement(target) {
   return Boolean(target.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""]'));
 }
 
-function toggleDragMode() {
-  dragEnabled = !dragEnabled;
+function setDragMode(nextEnabled) {
+  dragEnabled = nextEnabled;
   dragToggleButton.classList.toggle('active', dragEnabled);
-  dragToggleButton.textContent = `拖拽模型：${dragEnabled ? '开启' : '关闭'}`;
+  dragToggleButton.textContent = `拖拽基座：${dragEnabled ? '开启' : '关闭'}`;
 
   if (dragEnabled && currentRobot) {
+    if (ikEnabled) {
+      setIkMode(false);
+    }
     transformControls.attach(robotGroup);
     transformControls.visible = true;
   } else {
@@ -2117,8 +2662,13 @@ function toggleDragMode() {
   }
 }
 
+function toggleDragMode() {
+  setDragMode(!dragEnabled);
+}
+
 function animate() {
   requestAnimationFrame(animate);
+  tickContinuousIkSolve(performance.now());
   orbitControls.update();
   renderer.render(scene, camera);
 }
@@ -2145,6 +2695,9 @@ projectPicker.addEventListener('change', () => {
 
 reloadButton.addEventListener('click', () => loadRobot());
 dragToggleButton.addEventListener('click', () => toggleDragMode());
+ikToggleButton.addEventListener('click', () => toggleIkMode());
+ikLeftButton.addEventListener('click', () => selectIkHandle('left'));
+ikRightButton.addEventListener('click', () => selectIkHandle('right'));
 resetCameraButton.addEventListener('click', () => resetCamera());
 resetPoseButton.addEventListener('click', () => resetPose());
 playToggleButton.addEventListener('click', () => togglePlayback());
@@ -2176,7 +2729,20 @@ window.addEventListener('keydown', event => {
     return;
   }
 
-  if (event.code !== 'Space' || event.repeat || isEditableElement(event.target)) {
+  if (event.repeat || isEditableElement(event.target)) {
+    return;
+  }
+
+  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+    const delta = event.key === 'ArrowLeft' ? -KEYFRAME_KEYBOARD_NUDGE_SECONDS : KEYFRAME_KEYBOARD_NUDGE_SECONDS;
+    const handled = nudgeSelectedKeyframe(delta);
+    if (handled) {
+      event.preventDefault();
+    }
+    return;
+  }
+
+  if (event.code !== 'Space') {
     return;
   }
 

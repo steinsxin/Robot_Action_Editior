@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.ipynb_checkpoints
+.python-version
+*.pkl
+!action_pkls/*.pkl
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-workspace
+*.cache/
+
+# Log files
+*.log
+logs/
+log/
+
+# Audio files (keeping specific ones used in project)
+*.wav
+*.mp3
+
+# Binary data and large files
+*.model
+*.weights
+*.bin
+*.onnx
+*.pth
+*.pt
+*.h5
+*.pb
+*.tflite
+
+# System specific
+.directory
+Thumbs.DS
+test/*.pkl
+settings.toml
+robot_action.json
+configs/robot_v*.json

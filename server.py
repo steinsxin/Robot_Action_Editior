@@ -215,6 +215,7 @@ def normalize_project_payload(payload: dict) -> dict:
 
 class RobotViewerHandler(BaseHTTPRequestHandler):
     manifest = build_manifest()
+    ik_service = None
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -268,6 +269,10 @@ class RobotViewerHandler(BaseHTTPRequestHandler):
             self.handle_save_project()
             return
 
+        if request_path == "/api/ik/solve":
+            self.handle_ik_solve()
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def log_message(self, format: str, *args) -> None:
@@ -276,6 +281,22 @@ class RobotViewerHandler(BaseHTTPRequestHandler):
     def serve_json(self, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def serve_json_error(self, status: HTTPStatus, message: str, *, detail: str | None = None) -> None:
+        payload = {
+            "ok": False,
+            "error": status.phrase,
+            "message": message,
+        }
+        if detail:
+            payload["detail"] = detail
+
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -366,6 +387,36 @@ class RobotViewerHandler(BaseHTTPRequestHandler):
                 "title": normalized_payload["title"],
             }
         )
+
+    def handle_ik_solve(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self.serve_json_error(HTTPStatus.BAD_REQUEST, "Invalid JSON body")
+            return
+
+        if not isinstance(payload, dict):
+            self.serve_json_error(HTTPStatus.BAD_REQUEST, "Payload must be an object")
+            return
+
+        try:
+            if self.__class__.ik_service is None:
+                from ik_backend import DualArmIkService
+
+                self.__class__.ik_service = DualArmIkService()
+
+            result = self.__class__.ik_service.solve(payload)
+        except ValueError as error:
+            self.serve_json_error(HTTPStatus.BAD_REQUEST, str(error), detail=str(error))
+            return
+        except Exception as error:
+            self.serve_json_error(HTTPStatus.INTERNAL_SERVER_ERROR, "IK solve failed", detail=str(error))
+            return
+
+        self.serve_json(result)
 
 
 def sanitize_file_name(name: str) -> str:

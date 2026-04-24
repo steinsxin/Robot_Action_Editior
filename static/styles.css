@@ -706,6 +706,12 @@ button.playing,
   background: transparent;
   box-shadow: none;
   overflow: visible;
+  cursor: grab;
+  touch-action: none;
+}
+
+.keyframe-item:active {
+  cursor: grabbing;
 }
 
 .keyframe-item::before {
@@ -888,16 +894,15 @@ button.playing,
 .joint-drawer-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(3, 10, 16, 0.46);
   opacity: 0;
   pointer-events: none;
-  transition: opacity 160ms ease;
+  background: transparent;
   z-index: 40;
 }
 
 .joint-drawer-backdrop.open {
-  opacity: 1;
-  pointer-events: auto;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .joint-drawer {
