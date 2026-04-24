@@ -97,7 +97,8 @@ app.innerHTML = `
               <button id="delete-keyframe" type="button">删帧</button>
               <button id="add-voice-clip" type="button">插语音</button>
               <button id="delete-voice-clip" type="button">删语音</button>
-              <button id="save-project" type="button">保存</button>
+              <button id="new-project" type="button">新建工程</button>
+              <button id="save-project" type="button">保存工程</button>
               <button id="export-plan" type="button">导出100Hz</button>
             </div>
           </div>
@@ -278,6 +279,7 @@ const updateKeyframeButton = document.querySelector('#update-keyframe');
 const deleteKeyframeButton = document.querySelector('#delete-keyframe');
 const addVoiceClipButton = document.querySelector('#add-voice-clip');
 const deleteVoiceClipButton = document.querySelector('#delete-voice-clip');
+const newProjectButton = document.querySelector('#new-project');
 const saveProjectButton = document.querySelector('#save-project');
 const exportPlanButton = document.querySelector('#export-plan');
 const voiceTextInput = document.querySelector('#voice-text');
@@ -292,6 +294,7 @@ const DEFAULT_CONTROL_HZ = 100;
 const KEYFRAME_KEYBOARD_NUDGE_SECONDS = 0.1;
 const KEYFRAME_DRAG_THRESHOLD_PX = 4;
 const IK_SOLVE_INTERVAL_MS = 1000 / 30;
+const IK_JOINT_DIRTY_EPSILON = 1e-4;
 const IK_TRANSLATE_GIZMO_SIZE = 1;
 const IK_ROTATE_GIZMO_SIZE = 0.8;
 const IK_TARGET_LINKS = {
@@ -471,6 +474,7 @@ let previewedVoiceIds = new Set();
 let selectedKeyframeId = null;
 let selectedVoiceClipId = null;
 let pendingSelectedKeyframePoseSave = false;
+let currentProjectFileName = null;
 let activeJointDrawerGroupKey = null;
 let activeKeyframeDrag = null;
 let ikEnabled = false;
@@ -506,6 +510,9 @@ transformControls.addEventListener('dragging-changed', event => {
 
 transformControls.addEventListener('objectChange', () => {
   syncBaseInputs();
+  if (!transformDragging) {
+    return;
+  }
   markSelectedKeyframePoseDirty();
 });
 
@@ -644,9 +651,12 @@ function saveSelectedKeyframePose(options = {}) {
 
   keyframe.pose = captureCurrentPoseSnapshot();
   clearSelectedKeyframePoseDirty();
+  if (ikEnabled) {
+    setIkMode(false);
+  }
 
   if (!silent) {
-    setStatus(`已保存关键帧 ${keyframe.label} 的姿态。`);
+    setStatus(`已保存关键帧 ${keyframe.label} 的姿态，并已关闭 IK 拖拽。`);
   }
 
   return true;
@@ -1121,7 +1131,7 @@ function applyIkJointPositions(jointPositions) {
   }
 
   const jointMap = new Map(jointControllers.map(joint => [joint.name, joint]));
-  let appliedCount = 0;
+  let changedCount = 0;
 
   for (const [jointName, angle] of Object.entries(jointPositions)) {
     const joint = jointMap.get(jointName);
@@ -1130,12 +1140,17 @@ function applyIkJointPositions(jointPositions) {
     }
 
     const nextAngle = Number(angle);
+    const currentAngle = Number.isFinite(joint.angle) ? joint.angle : 0;
+    if (Math.abs(nextAngle - currentAngle) <= IK_JOINT_DIRTY_EPSILON) {
+      continue;
+    }
+
     joint.setJointValue(nextAngle);
     updateJointWidget(jointName, nextAngle);
-    appliedCount += 1;
+    changedCount += 1;
   }
 
-  if (appliedCount > 0) {
+  if (changedCount > 0) {
     currentRobot.updateMatrixWorld(true);
     robotGroup.updateMatrixWorld(true);
     markSelectedKeyframePoseDirty();
@@ -1653,6 +1668,11 @@ function populateProjectOptions(preferredFileName = '') {
   projectPicker.innerHTML = '';
   projectPicker.disabled = false;
 
+  const placeholderOption = document.createElement('option');
+  placeholderOption.value = '';
+  placeholderOption.textContent = '选择工程...';
+  projectPicker.appendChild(placeholderOption);
+
   for (const project of savedProjects) {
     const option = document.createElement('option');
     option.value = project.fileName;
@@ -1662,7 +1682,7 @@ function populateProjectOptions(preferredFileName = '') {
 
   const selectedFileName = preferredFileName && savedProjects.some(project => project.fileName === preferredFileName)
     ? preferredFileName
-    : savedProjects[0].fileName;
+    : '';
 
   projectPicker.value = selectedFileName;
 }
@@ -2452,7 +2472,9 @@ function renderComposer() {
 }
 
 function buildProjectPayload() {
-  resolvePendingSelectedKeyframePose('保存项目');
+  if (pendingSelectedKeyframePoseSave) {
+    saveSelectedKeyframePose({ silent: true });
+  }
   syncStateFromProjectFields();
   return {
     title: projectState.title,
@@ -2479,10 +2501,12 @@ function buildProjectPayload() {
   };
 }
 
-function loadProjectPayload(payload) {
+function loadProjectPayload(payload, options = {}) {
+  const { fileName = null } = options;
   resolvePendingSelectedKeyframePose('加载其他项目');
   stopPlayback({ keepCurrentTime: false });
   projectState = createProjectState(payload);
+  currentProjectFileName = fileName;
   selectedKeyframeId = projectState.actionKeyframes[0]?.id || null;
   selectedVoiceClipId = null;
   clearSelectedKeyframePoseDirty();
@@ -2490,8 +2514,69 @@ function loadProjectPayload(payload) {
   renderComposer();
 }
 
+function createNewProject() {
+  resolvePendingSelectedKeyframePose('新建工程');
+  stopPlayback({ keepCurrentTime: false });
+  projectState = createProjectState();
+  currentProjectFileName = null;
+  selectedKeyframeId = projectState.actionKeyframes[0]?.id || null;
+  selectedVoiceClipId = null;
+  clearSelectedKeyframePoseDirty();
+  syncProjectFieldsFromState();
+  renderComposer();
+  if (!projectPicker.disabled) {
+    projectPicker.value = '';
+  }
+  setStatus('已新建工程。');
+}
+
+function loadSelectedProject() {
+  const selected = savedProjects.find(project => project.fileName === projectPicker.value);
+  if (!selected) {
+    setStatus('请先选择一个工程文件。', true);
+    return;
+  }
+
+  loadProjectPayload(selected.payload || {}, { fileName: selected.fileName || null });
+  setStatus(`已加载项目: ${selected.title || selected.fileName}`);
+}
+
+async function refreshProjectsBeforeAction(preferredFileName = '') {
+  await refreshSavedProjects({ silent: true, preferredFileName });
+}
+
+async function handleNewProjectAction() {
+  try {
+    await refreshProjectsBeforeAction();
+    createNewProject();
+  } catch (error) {
+    console.error(error);
+    setStatus(`工程列表读取失败: ${error.message}`, true);
+  }
+}
+
 async function saveProject() {
+  if (!currentProjectFileName) {
+    const suggestedTitle = (projectState.title || projectTitleInput.value || 'untitled_project').trim() || 'untitled_project';
+    const nextTitle = window.prompt('请输入工程文件名', suggestedTitle);
+    if (nextTitle === null) {
+      return;
+    }
+
+    const trimmedTitle = nextTitle.trim();
+    if (!trimmedTitle) {
+      setStatus('工程保存失败: 工程文件名不能为空。', true);
+      return;
+    }
+
+    projectTitleInput.value = trimmedTitle;
+    projectState.title = trimmedTitle;
+  }
+
   const payload = buildProjectPayload();
+  if (currentProjectFileName) {
+    payload.fileName = currentProjectFileName;
+  }
 
   try {
     const response = await fetch('/api/save-project', {
@@ -2507,6 +2592,7 @@ async function saveProject() {
     }
 
     const result = await response.json();
+    currentProjectFileName = result.fileName || currentProjectFileName;
     await fetchSavedProjects(result.fileName);
     setStatus(`项目已保存: ${result.path}`);
   } catch (error) {
@@ -2573,6 +2659,18 @@ async function refreshSavedProjects(options = {}) {
     setProjectPlaceholder('项目列表读取失败');
     setStatus(`项目列表读取失败: ${error.message}`, true);
   }
+}
+
+async function handleSaveProjectAction() {
+  try {
+    await refreshProjectsBeforeAction(projectPicker.value);
+  } catch (error) {
+    console.error(error);
+    setStatus(`工程列表读取失败: ${error.message}`, true);
+    return;
+  }
+
+  await saveProject();
 }
 
 async function saveCurrentPose() {
@@ -2684,14 +2782,7 @@ fileSelect.addEventListener('change', () => {
   loadRobot();
 });
 
-projectPicker.addEventListener('change', () => {
-  const selected = savedProjects.find(project => project.fileName === projectPicker.value);
-  if (!selected) {
-    return;
-  }
-  loadProjectPayload(selected.payload || {});
-  setStatus(`已加载项目: ${selected.title || selected.fileName}`);
-});
+projectPicker.addEventListener('change', () => loadSelectedProject());
 
 reloadButton.addEventListener('click', () => loadRobot());
 dragToggleButton.addEventListener('click', () => toggleDragMode());
@@ -2710,7 +2801,8 @@ updateKeyframeButton.addEventListener('click', () => updateSelectedKeyframePose(
 deleteKeyframeButton.addEventListener('click', () => deleteSelectedKeyframe());
 addVoiceClipButton.addEventListener('click', () => addVoiceClip());
 deleteVoiceClipButton.addEventListener('click', () => deleteSelectedVoiceClip());
-saveProjectButton.addEventListener('click', () => saveProject());
+newProjectButton.addEventListener('click', () => handleNewProjectAction());
+saveProjectButton.addEventListener('click', () => handleSaveProjectAction());
 exportPlanButton.addEventListener('click', () => exportPlan());
 durationQuickInput.addEventListener('change', event => updateProjectDuration(event.currentTarget.value));
 extendDurationButton.addEventListener('click', () => updateProjectDuration(projectState.duration + 5));

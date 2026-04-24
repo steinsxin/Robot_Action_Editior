@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from datetime import datetime
 import json
 import mimetypes
@@ -18,6 +19,9 @@ STATIC_ROOT = PROJECT_ROOT / "static"
 SDK_URDF_PATH = Path(ROBOT_URDF_PATH).resolve()
 SAVED_ACTIONS_ROOT = PROJECT_ROOT / "saved_actions"
 SAVED_PROJECTS_ROOT = PROJECT_ROOT / "saved_projects"
+PROJECT_FILE_EXTENSION = ".alproj"
+LEGACY_PROJECT_FILE_EXTENSION = ".json"
+PROJECT_FILE_MAGIC = "AUTOLIFE_ROBOT_PROJECT_V1"
 
 
 def resolve_descriptions_root(urdf_path: Path) -> Path:
@@ -155,23 +159,51 @@ def default_project_payload() -> dict:
     }
 
 
+def encode_project_payload(payload: dict) -> str:
+    json_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(json_bytes).decode("ascii")
+    return f"{PROJECT_FILE_MAGIC}\n{encoded}\n"
+
+
+def decode_project_payload(raw_text: str, file_path: Path) -> dict:
+    if file_path.suffix == LEGACY_PROJECT_FILE_EXTENSION:
+        payload = json.loads(raw_text)
+    else:
+        lines = raw_text.splitlines()
+        if not lines or lines[0].strip() != PROJECT_FILE_MAGIC:
+            raise ValueError(f"Unsupported project file format: {file_path.name}")
+        encoded = "".join(line.strip() for line in lines[1:] if line.strip())
+        if not encoded:
+            raise ValueError(f"Project file payload is empty: {file_path.name}")
+        payload = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8"))
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"Project file payload must be an object: {file_path.name}")
+
+    return payload
+
+
+def iter_saved_project_paths() -> list[Path]:
+    if not SAVED_PROJECTS_ROOT.exists():
+        return []
+
+    paths = [
+        *SAVED_PROJECTS_ROOT.glob(f"*{PROJECT_FILE_EXTENSION}"),
+        *SAVED_PROJECTS_ROOT.glob(f"*{LEGACY_PROJECT_FILE_EXTENSION}"),
+    ]
+    return sorted(paths, key=lambda path: path.stat().st_mtime, reverse=True)
+
+
 def list_saved_projects() -> list[dict]:
     if not SAVED_PROJECTS_ROOT.exists():
         return []
 
     projects: list[dict] = []
 
-    for project_path in sorted(
-        SAVED_PROJECTS_ROOT.glob("*.json"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    ):
+    for project_path in iter_saved_project_paths():
         try:
-            payload = json.loads(project_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-
-        if not isinstance(payload, dict):
+            payload = decode_project_payload(project_path.read_text(encoding="utf-8"), project_path)
+        except (OSError, json.JSONDecodeError, ValueError, base64.binascii.Error):
             continue
 
         merged_payload = default_project_payload()
@@ -376,8 +408,9 @@ class RobotViewerHandler(BaseHTTPRequestHandler):
 
         normalized_payload = normalize_project_payload(payload)
         safe_title = sanitize_file_name(normalized_payload["title"])
-        target_path = next_available_project_path(safe_title)
-        target_path.write_text(format_json_payload(normalized_payload), encoding="utf-8")
+        requested_file_name = str(payload.get("fileName") or "").strip() or None
+        target_path = resolve_project_save_path(requested_file_name, safe_title)
+        target_path.write_text(encode_project_payload(normalized_payload), encoding="utf-8")
 
         self.serve_json(
             {
@@ -435,12 +468,21 @@ def next_available_action_path(base_name: str) -> Path:
 
 
 def next_available_project_path(base_name: str) -> Path:
-    candidate = SAVED_PROJECTS_ROOT / f"{base_name}.json"
+    candidate = SAVED_PROJECTS_ROOT / f"{base_name}{PROJECT_FILE_EXTENSION}"
     if not candidate.exists():
         return candidate
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return SAVED_PROJECTS_ROOT / f"{base_name}_{timestamp}.json"
+    return SAVED_PROJECTS_ROOT / f"{base_name}_{timestamp}{PROJECT_FILE_EXTENSION}"
+
+
+def resolve_project_save_path(file_name: str | None, base_name: str) -> Path:
+    if file_name:
+        requested_path = safe_join(SAVED_PROJECTS_ROOT, file_name)
+        if requested_path and requested_path.suffix == PROJECT_FILE_EXTENSION:
+            return requested_path
+
+    return next_available_project_path(base_name)
 
 
 def format_json_payload(payload: dict) -> str:

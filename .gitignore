@@ -63,10 +63,5 @@ log/
 *.pb
 *.tflite
 
-# System specific
-.directory
-Thumbs.DS
-test/*.pkl
-settings.toml
-robot_action.json
-configs/robot_v*.json
+# System files
+*.alproj
