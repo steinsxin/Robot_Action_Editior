@@ -291,6 +291,7 @@ const TIMELINE_PIXELS_PER_SECOND = 96;
 const PROJECT_MIN_DURATION = 1;
 const DEFAULT_PROJECT_DURATION = 12;
 const DEFAULT_CONTROL_HZ = 100;
+const IK_INTERPOLATION_SAMPLE_HZ = 30;
 const KEYFRAME_KEYBOARD_NUDGE_SECONDS = 0.1;
 const KEYFRAME_DRAG_THRESHOLD_PX = 4;
 const IK_SEGMENT_BLEND_WINDOW_SECONDS = 0.12;
@@ -2064,7 +2065,7 @@ function getIkInterpolationCacheKey(leftFrame, rightFrame) {
     rightTime: Number(rightFrame.time.toFixed(3)),
     leftJoints: leftPose.joints,
     rightJoints: rightPose.joints,
-    sampleHz: projectState.controlHz,
+    sampleHz: IK_INTERPOLATION_SAMPLE_HZ,
   });
 }
 
@@ -2094,7 +2095,7 @@ function buildIkInterpolationPayload(leftFrame, rightFrame) {
   return {
     leftJointPositions: sanitizePoseSnapshot(leftFrame.pose).joints,
     rightJointPositions: sanitizePoseSnapshot(rightFrame.pose).joints,
-    sampleHz: projectState.controlHz,
+    sampleHz: IK_INTERPOLATION_SAMPLE_HZ,
     duration: Math.max(rightFrame.time - leftFrame.time, 0.001),
   };
 }
