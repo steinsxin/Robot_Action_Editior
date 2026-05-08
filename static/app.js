@@ -2340,7 +2340,10 @@ function buildExportPlan() {
         yaw: Number((pose.base.yaw || 0).toFixed(6)),
       },
       joints: Object.fromEntries(
-        Object.entries(pose.joints || {}).map(([jointName, angle]) => [jointName, Number((angle || 0).toFixed(6))])
+        Object.entries(pose.joints || {}).map(([jointName, angle]) => [
+          jointName,
+          Number(THREE.MathUtils.radToDeg(angle || 0).toFixed(6)),
+        ])
       ),
     });
   }
@@ -2353,6 +2356,7 @@ function buildExportPlan() {
       generatedAt: new Date().toISOString(),
       model: modelSelect.value,
       file: fileSelect.value,
+      jointPositionUnit: 'degrees',
     },
     topics: { ...projectState.topics },
     motionPlan: {
@@ -2819,9 +2823,27 @@ async function exportPlan() {
   try {
     await ensureIkInterpolationReady();
     const payload = buildExportPlan();
-    const safeTitle = projectState.title.replace(/[^a-z0-9_-]+/gi, '_').replace(/^_+|_+$/g, '') || 'robot_plan';
-    downloadJson(`${safeTitle}_100hz_plan.json`, payload);
-    setStatus(`已导出 100Hz 计划，共 ${payload.motionPlan.frames.length} 帧。`);
+    const response = await fetch('/api/export-plan', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      let errorDetail = `Export request failed: ${response.status}`;
+      try {
+        const errorPayload = await response.json();
+        errorDetail = errorPayload.detail || errorPayload.message || errorPayload.error || errorDetail;
+      } catch {
+        // Keep the status fallback when the body is not JSON.
+      }
+      throw new Error(errorDetail);
+    }
+
+    const result = await response.json();
+    setStatus(`已导出 100Hz pickle: ${result.path}，共 ${result.commandCount} 帧。`);
   } catch (error) {
     console.error(error);
     setStatus(`导出失败: ${error.message}`, true);

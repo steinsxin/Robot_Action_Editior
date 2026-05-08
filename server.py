@@ -5,6 +5,7 @@ import base64
 from datetime import datetime
 import json
 import mimetypes
+import pickle
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,8 +20,10 @@ STATIC_ROOT = PROJECT_ROOT / "static"
 SDK_URDF_PATH = Path(ROBOT_URDF_PATH).resolve()
 SAVED_ACTIONS_ROOT = PROJECT_ROOT / "saved_actions"
 SAVED_PROJECTS_ROOT = PROJECT_ROOT / "saved_projects"
+EXPORTED_PLANS_ROOT = PROJECT_ROOT / "exported_plans"
 PROJECT_FILE_EXTENSION = ".alproj"
 LEGACY_PROJECT_FILE_EXTENSION = ".json"
+EXPORT_FILE_EXTENSION = ".pkl"
 PROJECT_FILE_MAGIC = "AUTOLIFE_ROBOT_PROJECT_V1"
 
 
@@ -301,6 +304,10 @@ class RobotViewerHandler(BaseHTTPRequestHandler):
             self.handle_save_project()
             return
 
+        if request_path == "/api/export-plan":
+            self.handle_export_plan()
+            return
+
         if request_path == "/api/ik/solve":
             self.handle_ik_solve()
             return
@@ -455,6 +462,42 @@ class RobotViewerHandler(BaseHTTPRequestHandler):
 
         self.serve_json(result)
 
+    def handle_export_plan(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self.serve_json_error(HTTPStatus.BAD_REQUEST, "Invalid JSON body")
+            return
+
+        if not isinstance(payload, dict):
+            self.serve_json_error(HTTPStatus.BAD_REQUEST, "Payload must be an object")
+            return
+
+        try:
+            export_payload = normalize_export_payload(payload)
+        except (TypeError, ValueError) as error:
+            self.serve_json_error(HTTPStatus.BAD_REQUEST, str(error), detail=str(error))
+            return
+
+        EXPORTED_PLANS_ROOT.mkdir(parents=True, exist_ok=True)
+        safe_title = sanitize_file_name(str(export_payload.get("title") or export_payload["meta"].get("title") or "robot_plan"))
+        target_path = next_available_export_path(safe_title)
+
+        with target_path.open("wb") as output_file:
+            pickle.dump(export_payload, output_file, protocol=pickle.HIGHEST_PROTOCOL)
+
+        self.serve_json(
+            {
+                "ok": True,
+                "path": str(target_path),
+                "fileName": target_path.name,
+                "commandCount": len(export_payload.get("commands") or []),
+            }
+        )
+
     def handle_ik_interpolate_keyframes(self) -> None:
         content_length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(content_length)
@@ -510,6 +553,15 @@ def next_available_project_path(base_name: str) -> Path:
     return SAVED_PROJECTS_ROOT / f"{base_name}_{timestamp}{PROJECT_FILE_EXTENSION}"
 
 
+def next_available_export_path(base_name: str) -> Path:
+    candidate = EXPORTED_PLANS_ROOT / f"{base_name}_100hz{EXPORT_FILE_EXTENSION}"
+    if not candidate.exists():
+        return candidate
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return EXPORTED_PLANS_ROOT / f"{base_name}_100hz_{timestamp}{EXPORT_FILE_EXTENSION}"
+
+
 def resolve_project_save_path(file_name: str | None, base_name: str) -> Path:
     if file_name:
         requested_path = safe_join(SAVED_PROJECTS_ROOT, file_name)
@@ -517,6 +569,95 @@ def resolve_project_save_path(file_name: str | None, base_name: str) -> Path:
             return requested_path
 
     return next_available_project_path(base_name)
+
+
+def normalize_export_payload(payload: dict) -> dict:
+    meta = payload.get("meta")
+    motion_plan = payload.get("motionPlan")
+
+    if not isinstance(meta, dict):
+        raise ValueError("meta must be an object")
+    if not isinstance(motion_plan, dict):
+        raise ValueError("motionPlan must be an object")
+
+    frames = motion_plan.get("frames")
+    if not isinstance(frames, list) or not frames:
+        raise ValueError("motionPlan.frames must be a non-empty array")
+
+    commands = [normalize_export_command(frame) for frame in frames]
+
+    return {
+        "title": str(meta.get("title") or "robot_plan"),
+        "meta": {
+            "title": str(meta.get("title") or "robot_plan"),
+            "duration": float(meta.get("duration") or 0.0),
+            "controlHz": int(meta.get("controlHz") or 100),
+            "generatedAt": meta.get("generatedAt"),
+            "model": meta.get("model"),
+            "file": meta.get("file"),
+        },
+        "topics": payload.get("topics") if isinstance(payload.get("topics"), dict) else {},
+        "motionPlan": {
+            "topic": motion_plan.get("topic"),
+            "sampleHz": int(motion_plan.get("sampleHz") or meta.get("controlHz") or 100),
+            "frameCount": len(commands),
+        },
+        "voicePlan": payload.get("voicePlan") if isinstance(payload.get("voicePlan"), dict) else {},
+        "commands": commands,
+    }
+
+
+def normalize_export_command(frame: dict) -> dict:
+    if not isinstance(frame, dict):
+        raise ValueError("Each motionPlan frame must be an object")
+
+    joints = frame.get("joints")
+    if not isinstance(joints, dict):
+        raise ValueError("Each motionPlan frame must contain a joints object")
+
+    return {
+        "time": float(frame.get("time") or 0.0),
+        "left_arm_joint_state": {
+            "position": [float(joints.get(joint_name, 0.0)) for joint_name in LEFT_ARM_JOINTS],
+        },
+        "right_arm_joint_state": {
+            "position": [float(joints.get(joint_name, 0.0)) for joint_name in RIGHT_ARM_JOINTS],
+        },
+        "waist_joint_state": {
+            "position": [float(joints.get(joint_name, 0.0)) for joint_name in WAIST_JOINTS],
+        },
+        "waist_leg_joint_state": {
+            "position": [float(joints.get(joint_name, 0.0)) for joint_name in WAIST_JOINTS],
+        },
+    }
+
+
+LEFT_ARM_JOINTS = [
+    "Joint_Left_Shoulder_Inner",
+    "Joint_Left_Shoulder_Outer",
+    "Joint_Left_UpperArm",
+    "Joint_Left_Elbow",
+    "Joint_Left_Forearm",
+    "Joint_Left_Wrist_Upper",
+    "Joint_Left_Wrist_Lower",
+]
+
+RIGHT_ARM_JOINTS = [
+    "Joint_Right_Shoulder_Inner",
+    "Joint_Right_Shoulder_Outer",
+    "Joint_Right_UpperArm",
+    "Joint_Right_Elbow",
+    "Joint_Right_Forearm",
+    "Joint_Right_Wrist_Upper",
+    "Joint_Right_Wrist_Lower",
+]
+
+WAIST_JOINTS = [
+    "Joint_Ankle",
+    "Joint_Knee",
+    "Joint_Waist_Pitch",
+    "Joint_Waist_Yaw",
+]
 
 
 def format_json_payload(payload: dict) -> str:
